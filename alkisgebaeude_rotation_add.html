@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Leaflet Map with CO₂ Buildings & House Numbers</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100%; width: 100%; }
+
+    .chart-control {
+      background-color: white;
+      padding: 10px;
+      border-radius: 8px;
+      box-shadow: 0 0 5px rgba(0,0,0,0.3);
+    }
+    #co2Chart { width: 250px; height: 200px; }
+
+    #projektFilter {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 1000;
+      padding: 5px;
+      background: white;
+      border: 1px solid #ccc;
+    }
+
+    .legend {
+      background: white;
+      padding: 8px;
+      border-radius: 6px;
+      line-height: 18px;
+      color: #555;
+      box-shadow: 0 0 5px rgba(0,0,0,0.3);
+    }
+    .legend i {
+      width: 18px;
+      height: 18px;
+      float: left;
+      margin-right: 8px;
+      opacity: 0.7;
+    }
+
+    .house-number-label {
+      background: transparent;
+      border: none;
+      text-align: center;
+      white-space: nowrap;
+      font-size: 10px;
+      font-weight: bold;
+      color: black;
+    }
+  </style>
+</head>
+<body>
+
+<select id="projektFilter">
+  <option value="all">All Projects</option>
+</select>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<script>
+const map = L.map('map').setView([51, 10], 6);
+
+// Light OSM base map
+L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/">OSM</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
+  subdomains: 'abcd',
+  maxZoom: 20
+}).addTo(map);
+
+// Globals
+let geojsonData, geojsonLayer;
+let co2Chart;
+let selectedBuilding = null;
+
+// Chart control
+const chartControl = L.control({ position: 'topright' });
+chartControl.onAdd = function () {
+  const div = L.DomUtil.create('div', 'chart-control');
+  div.innerHTML = '<canvas id="co2Chart"></canvas>';
+  return div;
+};
+chartControl.addTo(map);
+
+// CO₂ class color mapping
+function getColorByClass(cls){
+  switch(cls){
+    case "a": return "#2ECC40";
+    case "b": return "#FFDC00";
+    case "c": return "#FF851B";
+    case "d": return "#FF4136";
+    default: return "#AAAAAA";
+  }
+}
+
+// Legend
+const legend = L.control({ position: "bottomright" });
+legend.onAdd = function () {
+  const div = L.DomUtil.create("div", "legend");
+  const categories = [
+    { label: "Class A", color: "#2ECC40" },
+    { label: "Class B", color: "#FFDC00" },
+    { label: "Class C", color: "#FF851B" },
+    { label: "Class D", color: "#FF4136" }
+  ];
+  div.innerHTML = "<strong>CO₂ Class</strong><br>";
+  categories.forEach(c => div.innerHTML += `<i style="background:${c.color}"></i>${c.label}<br>`);
+  return div;
+};
+legend.addTo(map);
+
+// Load energy buildings
+fetch('energy.geojson')
+  .then(res => res.json())
+  .then(data => {
+    geojsonData = data;
+
+    // Populate project filter
+    const ids = new Set();
+    data.features.forEach(f => {
+      if(f.properties.energy_projekt_id) ids.add(f.properties.energy_projekt_id);
+    });
+    const select = document.getElementById("projektFilter");
+    Array.from(ids).sort().forEach(id => {
+      const opt = document.createElement("option");
+      opt.value = id;
+      opt.textContent = id;
+      select.appendChild(opt);
+    });
+
+    updateLayer("all");
+    updateChart("all");
+  });
+
+// Update building layer
+function updateLayer(projektId){
+  if(geojsonLayer) map.removeLayer(geojsonLayer);
+
+  geojsonLayer = L.geoJSON(geojsonData, {
+    filter: f => projektId==="all" || f.properties.energy_projekt_id===projektId,
+    onEachFeature: (feature, layer) => {
+      layer.bindPopup(Object.entries(feature.properties)
+        .map(([k,v]) => `<strong>${k}</strong>: ${v}`).join('<br>'));
+      layer.on("click", () => {
+        selectedBuilding = feature;
+        console.log("Selected building:", feature.properties.energy_projekt_id);
+      });
+    },
+    style: f => ({
+      color: "#333",
+      weight: 1,
+      fillColor: getColorByClass(f.properties.co2_class),
+      fillOpacity: 0.7
+    })
+  }).addTo(map);
+
+  const bounds = geojsonLayer.getBounds();
+  if(bounds.isValid()) map.fitBounds(bounds);
+}
+
+// CO₂ chart
+function updateChart(projektId){
+  const filtered = geojsonData.features.filter(f =>
+    projektId==="all" || f.properties.energy_projekt_id===projektId
+  );
+  let beginTotal=0,endTotal=0,count=0;
+  filtered.forEach(f=>{
+    const b=parseFloat(f.properties.energy_begin_co2_from_energy_demand);
+    const e=parseFloat(f.properties.energy_end_co2_from_energy_demand);
+    if(!isNaN(b)&&!isNaN(e)){
+      beginTotal+=b; endTotal+=e; count++;
+    }
+  });
+  const beginValue = count>0 ? beginTotal : 0;
+  const endValue = count>0 ? endTotal : 0;
+  const ctx = document.getElementById("co2Chart").getContext("2d");
+  if(co2Chart) co2Chart.destroy();
+  co2Chart = new Chart(ctx,{
+    type:'bar',
+    data:{
+      labels:['Begin CO₂','End CO₂'],
+      datasets:[{label:'CO₂ from Energy Demand (kg)',data:[beginValue,endValue],backgroundColor:['#FF4136','#2ECC40']}]
+    },
+    options:{
+      responsive:false,
+      plugins:{legend:{display:true},title:{display:true,text:projektId==="all"?'All Projects':`Project: ${projektId}`}},
+      scales:{y:{title:{display:true,text:'CO₂ (kg)'},beginAtZero:true}}
+    }
+  });
+}
+
+// Dropdown handler
+document.getElementById("projektFilter").addEventListener("change",function(){
+  const selected=this.value;
+  updateLayer(selected);
+  updateChart(selected);
+});
+
+// ===== House Number Layer =====
+let houseNumberLayer = L.geoJSON(null,{
+  pointToLayer: (feature, latlng)=>{
+    let art = feature.properties.art.split(";");
+    let rotation = parseFloat(art[2])*(180/Math.PI);
+    const houseNumber = art[4];
+    const icon = L.divIcon({
+      className:"house-number-label",
+      html:`<div style="transform: rotate(${rotation}deg); transform-origin:center;">${houseNumber}</div>`
+    });
+    const marker = L.marker(latlng,{icon:icon});
+
+    // Rotation on click
+    marker.on("click",()=>{
+      rotation = (rotation+15)%360;
+      art[2] = (rotation*Math.PI/180).toFixed(6);
+      feature.properties.art = art.join(";");
+      marker.setIcon(L.divIcon({
+        className:"house-number-label",
+        html:`<div style="transform: rotate(${rotation}deg); transform-origin:center;">${houseNumber}</div>`
+      }));
+    });
+
+    return marker;
+  }
+}).addTo(map);
+
+// Load existing house numbers
+fetch('house_number.geojson')
+  .then(res=>res.json())
+  .then(data=>{ houseNumberLayer.addData(data); });
+
+// ===== Add New House Numbers =====
+let addHouseMode=false;
+const addButton=L.control({position:"topright"});
+addButton.onAdd=function(){
+  const div=L.DomUtil.create("div","leaflet-bar");
+  div.innerHTML='<a href="#" title="Add House Number">🏠+</a>';
+  div.style.background="white"; div.style.padding="2px 6px"; div.style.cursor="pointer";
+  div.onclick=()=>{ addHouseMode=!addHouseMode; div.style.background=addHouseMode?"#cce5ff":"white"; };
+  return div;
+};
+addButton.addTo(map);
+
+// Click to add
+map.on("click", function(e){
+  if(!addHouseMode || !selectedBuilding) return;
+  const houseNumber=prompt("Enter house number:");
+  if(!houseNumber) return;
+
+  // Position from click, rotation=0
+  let art=`${e.latlng.lng};${e.latlng.lat};0;HNR;${houseNumber}`;
+  const newFeature={
+    "type":"Feature",
+    "geometry":{"type":"Point","coordinates":[e.latlng.lng,e.latlng.lat]},
+    "properties":{"art":art,"building_id":selectedBuilding.properties.energy_projekt_id}
+  };
+  houseNumberLayer.addData(newFeature);
+  console.log("New house number added:",newFeature);
+});
+
+// ===== Export Button =====
+const exportButton = L.control({position:"topright"});
+exportButton.onAdd=function(){
+  const div=L.DomUtil.create("div","leaflet-bar");
+  div.innerHTML='<a href="#" title="Export House Numbers">💾</a>';
+  div.style.background="white"; div.style.padding="2px 6px"; div.style.cursor="pointer";
+  div.onclick=()=>{
+    const dataStr=JSON.stringify(houseNumberLayer.toGeoJSON());
+    const blob=new Blob([dataStr],{type:"application/json"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url; a.download="house_number_updated.geojson"; a.click();
+    URL.revokeObjectURL(url);
+  };
+  return div;
+};
+exportButton.addTo(map);
+</script>
+
+</body>
+</html>
